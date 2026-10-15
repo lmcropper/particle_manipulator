@@ -29,6 +29,14 @@ python -m pip install -r requirements.txt
 python piston_particle_solver.py --frequency 10 --peak-speed 2
 ```
 
+CUDA acceleration is optional. Install a CuPy wheel that matches the installed
+CUDA runtime (for example, `python -m pip install cupy-cuda12x`), then use
+`--device cuda`. CUDA uses fixed-step RK4; set `--cuda-steps-per-period` to
+adjust its time resolution (default 1000). The direct `simulate()` API also
+accepts `backend="cuda"` and `cuda_steps_per_period=1000`. Its CPU backend keeps
+the adaptive SciPy solver and remains the default. CUDA currently supports the
+built-in sphere drag model and does not support custom axial-force callbacks.
+
 The example uses a smooth asymmetric waveform made from a fundamental plus a
 second harmonic. It plots particle position, air and particle velocities,
 particle Reynolds number, and drag force.
@@ -86,34 +94,133 @@ waveform.csv`. Use `--no-plot` to print the summary only.
 
 ## Optimize a transport waveform
 
-Search for a zero-mean periodic waveform that transports the particles in a
-chosen direction while reducing the spread in their final displacements:
+Search for a periodic Fourier air-displacement waveform that gives similar net
+transport across particle sizes:
 
 ```bash
-python optimize_particle_waveform.py --duration 1 --frequency 10 --peak-speed 2
+python optimize_particle_waveform.py --duration 1 --frequency 80 --peak-air-displacement-mm 10
 ```
 
-The script uses a Fourier waveform with three harmonics by default and
-minimizes size-to-size displacement spread, subject to a minimum mean
-transport requirement. It does not reward additional transport beyond that
-floor. It reports each size's net displacement, plots the optimized waveform
-and particle motion, and saves `optimized_waveform.csv` in the current directory. That CSV can be used
-by the solver or size-comparison script with `--csv`. By default mean net
-displacement across the selected sizes must reach at least 10 mm in the chosen
-direction; change the floor with `--min-displacement-mm`. The script reports
-failure and does not save a waveform if the search cannot meet that requirement. Use
-`--sizes-um`, `--harmonics`, `--direction -1`, `--maxiter`, and `--seed` to
-configure the search. The peak air speed remains fixed at the value set by
-`--peak-speed`. During the search it prints the best mean transport, size
-spread, floor status, and convergence once per iteration.
+The Fourier coefficients define zero-mean air displacement. The script
+differentiates that curve to obtain the air velocity used by the particle
+solver. `--peak-air-displacement-mm` (default 10) is the maximum displacement
+amplitude, and `--max-air-speed` (default 5 m/s) reduces that amplitude for a
+candidate whose derivative would exceed the speed cap. The score is the
+standard deviation of net transport minus `--transport-reward-weight`
+(default 0.2) times the mean directed transport above
+`--min-mean-displacement-mm` (default 5). The minimum is also a hard
+optimization constraint. Set `--direction -1` for transport in the negative
+solver direction. Random exploration seeds differential evolution with feasible
+and diverse candidates. Its results include the spread, mean transport, score,
+and displacement for each particle size. The saved `optimized_waveform.csv`
+contains phase, derived air velocity, and air displacement; velocity remains
+the second column for the solver's `--csv` loader. The optimizer still reports,
+saves, and plots its best available result if it does not converge or misses
+the transport minimum. It does not run a local polishing step.
+
+The optimizer accepts `--device auto`, `--device cpu`, or `--device cuda`.
+`auto` uses CUDA when CuPy and a CUDA GPU are available and otherwise falls
+back to CPU. CUDA evaluates differential-evolution populations as batches of
+particle simulations; its fixed-step RK4 resolution is controlled by
+`--cuda-steps-per-period` (default 1000). CPU-only installations need no CuPy.
+Both waveform optimizers report random-exploration progress, including samples
+completed, feasible count, and the best result found so far.
 
 The velocity column should be the local air velocity in m/s, not the
 subwoofer drive voltage. If the input is cone displacement, differentiate it
 to obtain cone velocity and add the chamber area/flow model later.
 
+## Optimize an air displacement waveform
+
+The segment optimizer parameterizes the periodic **air displacement** as
+linear segments with adjustable durations and slopes:
+
+```bash
+python optimize_segment_waveform.py --segments 4 --peak-air-displacement-mm 10
+```
+
+`--peak-air-displacement-mm` sets the maximum absolute displacement from its
+time-mean position. Before simulation, the script applies a periodic,
+zero-phase Gaussian low-pass filter to this segmented displacement. The default
+`--lowpass-hz 240` is the filter's -3 dB cutoff; set it to 0 to compare against
+the unfiltered segments. The solver receives the derivative of the filtered
+displacement, so air velocity is continuous across segment borders.
+`--max-air-speed` (default 5 m/s) caps both unfiltered and filtered air speed,
+and `--max-velocity-jump` (default 8 m/s) caps the unfiltered speed change at
+every segment border, including the period boundary. A candidate that would
+exceed a cap is simulated at a smaller displacement amplitude. The CSV saves
+phase, filtered air velocity and displacement, then unfiltered velocity and
+displacement. Filtered velocity remains the second column for the existing
+`--csv` loader. This is an air displacement model, not yet a geometric
+conversion from measured speaker-cone displacement.
+
+## Saved optimization results
+
+Both optimizers save a compressed MATLAB `.mat` file in
+`optimization_results/` after each run, including runs that did not converge
+or meet the transport minimum. Use `--results-dir` to choose another directory.
+Filenames contain the waveform type, local timestamp, main frequency, transport
+spread, mean directed transport, and feasibility status. Each file contains the optimizer
+parameters and settings, sampled air displacement and velocity, every particle
+trajectory and diagnostic array, and final transport metrics. Segment results
+also include durations, vertices, slopes, and the raw segmented waveform;
+Fourier results include all Fourier coefficients.
+
+To recreate the same four-panel figure without rerunning the optimizer:
+
+```bash
+python plot_optimization_result.py optimization_results/YOUR_RESULT.mat
+python plot_optimization_result.py optimization_results/YOUR_RESULT.mat --save-figure result.png --no-show
+```
+
+## Compare with triangle and sawtooth waves
+
+`compare_triangle_symmetry.py` sweeps the fraction of each cycle spent rising
+from minimum to maximum air displacement. A fraction of 0.5 is a symmetric
+triangle; values close to 0 or 1 approach sawtooths in opposite directions.
+The script reads frequency, particle sizes, duration, density, low-pass cutoff,
+and displacement, speed, and segment-jump limits from an optimized `.mat` file.
+It prints mean directed transport and standard deviation across particle sizes,
+then saves a CSV and four-panel PNG beside the input file.
+
+```bash
+python compare_triangle_symmetry.py optimization_results/YOUR_800Hz_RESULT.mat --no-show --verify-best
+```
+
+Use `--fractions 0.01,0.05,0.25,0.5,0.75,0.95,0.99` for a shorter sweep. The
+default `--device auto` uses CUDA when available; `--device cpu` runs the
+adaptive solver for every triangle. `--verify-best` also checks the best
+feasible triangle with the adaptive CPU solver. A near-sawtooth may have a
+smaller displacement amplitude because the saved speed and segment-jump caps
+apply to every comparison waveform.
+
+## Sweep the amplitude of a saved waveform
+
+Use `compare_amplitude_sweep.py` to keep an optimized waveform's shape fixed
+while multiplying its air displacement and velocity by 0.1x through 10x. The
+script reads the particle sizes, density, frequency, duration, and air
+properties from the selected optimization `.mat` file, then saves a CSV of
+per-size net transports and a PNG showing transport and spread versus
+amplitude.
+
+```bash
+python compare_amplitude_sweep.py optimization_results/YOUR_RESULT.mat --no-show
+```
+
+Omit the `.mat` path to choose from the 20 most recent saved results in a
+terminal.
+
+The default sweep has 21 logarithmically spaced multipliers, including 1x.
+Use `--factors 0.1,0.25,0.5,1,2,5,10` for a custom list or `--sizes-um
+30,50,70,100` to choose different diameters. `--device auto` uses CUDA when
+available; `--device cpu` uses the adaptive solver. Multipliers are not
+clamped to the original optimization limits: the table, CSV, and shaded plot
+region flag amplitudes that exceed those limits.
+
 ## Important current assumptions
 
-- The air velocity is spatially uniform and equal to the piston velocity.
+- The prescribed air velocity is spatially uniform; speaker-cone motion is not
+  converted through a chamber geometry.
 - The other end is treated as open, so no chamber standing-wave solution is
   included.
 - Drag is quasi-steady; added mass, Basset history, acoustic radiation force,

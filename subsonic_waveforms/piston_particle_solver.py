@@ -217,12 +217,65 @@ def simulate(
     rtol: float = 1e-8,
     atol: float = 1e-10,
     drag_model: DragFunction = sphere_drag_force,
+    backend: str = "cpu",
+    cuda_steps_per_period: int = 1000,
 ) -> SimulationResult:
-    """Integrate particle motion in a spatially uniform piston flow."""
+    """Integrate particle motion in a spatially uniform piston flow.
+
+    ``backend="cuda"`` uses fixed-step RK4 and requires CuPy plus a CUDA GPU.
+    The default CPU backend retains adaptive DOP853 integration.
+    """
     if piston.frequency_hz <= 0.0:
         raise ValueError("frequency_hz must be positive.")
     if duration <= 0.0:
         raise ValueError("duration must be positive.")
+
+    if backend not in {"cpu", "cuda"}:
+        raise ValueError("backend must be 'cpu' or 'cuda'.")
+    if backend == "cuda":
+        if axial_force is not None:
+            raise ValueError("The CUDA backend does not support custom axial_force callbacks.")
+        if drag_model is not sphere_drag_force:
+            raise ValueError("The CUDA backend currently supports sphere_drag_force only.")
+        if cuda_steps_per_period < 4:
+            raise ValueError("cuda_steps_per_period must be at least 4.")
+        try:
+            from .cuda_backend import integrate_batch, sample_waveform
+        except ImportError:
+            from cuda_backend import integrate_batch, sample_waveform
+
+        wave = sample_waveform(piston.waveform) * piston.peak_speed
+        _final, steps, positions, velocities = integrate_batch(
+            wave,
+            piston.frequency_hz,
+            duration,
+            np.asarray([particle.diameter]),
+            np.asarray([particle.density]),
+            air.density,
+            air.dynamic_viscosity,
+            cuda_steps_per_period,
+            initial_position,
+            initial_velocity,
+            save_trajectory=True,
+        )
+        time = np.linspace(0.0, duration, steps + 1)
+        position = positions[0, 0]
+        particle_velocity = velocities[0, 0]
+        air_velocity = np.asarray([piston.velocity(t) for t in time])
+        relative_velocity = air_velocity - particle_velocity
+        reynolds_number = (
+            air.density * particle.diameter * np.abs(relative_velocity) / air.dynamic_viscosity
+        )
+        drag_force = np.asarray([sphere_drag_force(w, particle, air) for w in relative_velocity])
+        return SimulationResult(
+            time=time,
+            position=position,
+            particle_velocity=particle_velocity,
+            air_velocity=air_velocity,
+            relative_velocity=relative_velocity,
+            reynolds_number=reynolds_number,
+            drag_force=drag_force,
+        )
 
     period = 1.0 / piston.frequency_hz
     max_step = period / max_step_fraction
@@ -310,6 +363,13 @@ def main() -> None:
     )
     parser.add_argument("--particle-density", type=float, default=2500.0, help="Particle density [kg/m^3].")
     parser.add_argument("--csv", type=str, default=None, help="CSV containing phase and velocity columns.")
+    parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu", help="Integration device.")
+    parser.add_argument(
+        "--cuda-steps-per-period",
+        type=int,
+        default=1000,
+        help="Fixed RK4 steps per period when --device=cuda.",
+    )
     parser.add_argument("--no-plot", action="store_true", help="Do not open the result plot.")
     args = parser.parse_args()
 
@@ -328,7 +388,13 @@ def main() -> None:
         density=args.particle_density,
     )
     duration = args.duration if args.duration is not None else 20.0 / frequency
-    result = simulate(piston, particle=particle, duration=duration)
+    result = simulate(
+        piston,
+        particle=particle,
+        duration=duration,
+        backend=args.device,
+        cuda_steps_per_period=args.cuda_steps_per_period,
+    )
 
     starts, displacements = result.cycle_displacements(frequency)
     if len(displacements):
